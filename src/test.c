@@ -52,7 +52,7 @@ static bool ws_handshake_get_header(const char* request,
         start += strlen(crlf);
         if (strstr(start, header) == start) {
             const char* end = strstr(start, crlf);
-            if (!end || end - start >= value_out_len - 1) {
+            if (!end || end - start >= (ssize_t) value_out_len - 1) {
                 break;
             }
             const size_t len = strlen(header);
@@ -74,7 +74,7 @@ ws_handshake_hash_key(const char* key, char* hash_out, size_t hash_out_len) {
                   > 0;
 }
 
-static bool ws_listen(uint16_t port, int* fd_out) {
+static bool ws_listen(const uint16_t port, int* fd_out) {
     int sockfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (sockfd < 0) {
         return false;
@@ -98,7 +98,7 @@ static bool ws_listen(uint16_t port, int* fd_out) {
     return true;
 }
 
-static bool ws_create_epoll(int sockfd, int* epfd_out) {
+static bool ws_create_epoll(const int sockfd, int* epfd_out) {
     int epfd = epoll_create1(0);
     if (epoll_ctl(epfd,
                   EPOLL_CTL_ADD,
@@ -115,7 +115,7 @@ static bool ws_create_epoll(int sockfd, int* epfd_out) {
     return true;
 }
 
-static bool ws_frontend_accept(int sockfd, int epfd) {
+static bool ws_frontend_accept(const int sockfd, const int epfd) {
     struct sockaddr_in addr = {0};
     int clientfd = accept4(sockfd,
                            (struct sockaddr*)&addr,
@@ -144,7 +144,7 @@ static bool ws_frontend_accept(int sockfd, int epfd) {
     return true;
 }
 
-static bool ws_frontend_handshake(struct ws_buf* ws) {
+static bool ws_frontend_handshake(const struct ws_buf* ws) {
     char key[255] = {0};
     if (!strstr((char*)ws->buffer, "\r\n\r\n")
         || !ws_handshake_get_header(
@@ -163,14 +163,15 @@ static bool ws_frontend_handshake(struct ws_buf* ws) {
             "Sec-WebSocket-Protocol: binary\r\n"
             "Sec-WebSocket-Accept: %s\r\n\r\n",
             hash);
-    size_t http_response_len = strlen(http_response);
+    ssize_t http_response_len = strlen(http_response);
     if (write(ws->fd, http_response, http_response_len) != http_response_len) {
         printf("incomplete write\n");
     }
     return true;
 }
 
-static bool ws_backend_connect(struct ws_buf* ws, int epfd, int* sockfd_out) {
+static bool
+ws_backend_connect(const struct ws_buf* ws, const int epfd, int* sockfd_out) {
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(BACKEND_PORT);
@@ -193,7 +194,7 @@ static bool ws_backend_connect(struct ws_buf* ws, int epfd, int* sockfd_out) {
                   sockfd,
                   &(struct epoll_event){
                       .events = EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLHUP,
-                      .data.ptr = ws,
+                      .data.ptr = (void*)ws,
                   })) {
         perror("epoll_ctl");
         close(sockfd);
@@ -204,20 +205,85 @@ static bool ws_backend_connect(struct ws_buf* ws, int epfd, int* sockfd_out) {
     return true;
 }
 
-static bool ws_frontend_read(struct ws_buf* ws, int epfd) {
+static void ws_encode_frame(const uint8_t* data,
+                            const size_t len,
+                            uint8_t* encoded,
+                            size_t* encoded_len) {
+
+    uint8_t offset = 2;
+    encoded[0] = 0x80 | 0x02;
+    if (len < 126) {
+        encoded[1] = len;
+    } else {
+        encoded[1] = 126;
+        encoded[2] = len >> 8;
+        encoded[3] = len & 0xff;
+        offset += 2;
+    }
+    memcpy(encoded + offset, data, len);
+    *encoded_len = len + offset;
+
+    /*
+    uint8_t fin = encoded[0] & 0x80;
+    uint8_t opcode = encoded[0] & 0x0f;
+    uint8_t mask = encoded[1] & 0x80;
+    uint8_t len1 = encoded[1] & 0x7F;
+    printf("FIN: %u\n", fin != 0);
+    printf("opcode binary: %u\n", opcode == 0x02);
+    printf("mask: %u\n", mask != 0);
+    printf("len1: %u / %lu\n", len1, len);
+    */
+}
+
+static void ws_decode_frame(uint8_t* frame,
+                            const size_t len,
+                            uint8_t** decoded_out,
+                            size_t* decoded_len) {
+    uint8_t fin = frame[0] & 0x80;
+    uint8_t opcode = frame[0] & 0x0f;
+    uint8_t mask = frame[1] & 0x80;
+    uint16_t len1 = (uint8_t)(frame[1] & 0x7F);
+    uint8_t offset = 6;
+    if (len1 > 125) {
+        offset += 2;
+        len1 = (frame[2] << 8) | frame[3];
+    }
+    for (uint16_t i = 0; i < len1 && offset + i < len; i++) {
+        frame[offset + i] ^= (frame + (offset - 4))[i % 4];
+    }
+    *decoded_out = frame + offset;
+    *decoded_len = len1;
+
+    /*
+    printf("FIN: %u\n", fin != 0);
+    printf("opcode binary: %u\n", opcode == 0x02);
+    printf("mask: %u\n", mask != 0);
+    printf("len1: %u\n", len1);
+    
+    printf("masking key: %02x%02x%02x%02x\n",
+           frame[2],
+           frame[3],
+           frame[4],
+           frame[5]);
+    printf("application data:\n  ");
+    for (int i = 0; i < len1; i++) {
+        printf("%02x", frame[offset + i]);
+        if ((i + 1) % 2 == 0) {
+            printf((i + 1) % 16 == 0 ? "\n  " : " ");
+        }
+    }
+    printf("\n");
+        */
+}
+
+static bool ws_frontend_read(struct ws_buf* ws, const int epfd) {
     while (true) {
         ssize_t len = read(
             ws->fd, ws->buffer + ws->len, sizeof(ws->buffer) - ws->len - 1);
-        printf("client read %ld\n", len);
+        printf("client read %ld (from %ld)\n", len, ws->len);
         if (len <= 0) {
             break;
         }
-        printf(">--read-->\n");
-        for (ssize_t i = 0; i < len; i++) {
-            printf("0x%02x, ", ws->buffer[ws->len + i]);
-        }
-        printf("<--read--<\n");
-
         ws->len += len;
         ws->buffer[ws->len] = 0;
 
@@ -233,19 +299,58 @@ static bool ws_frontend_read(struct ws_buf* ws, int epfd) {
                     return false;
                 }
                 ws->next = backend;
+                backend->next = ws;
             }
         } else if (ws->state == WS_FE_CONNECTED) {
             struct ws_buf* backend = ws->next;
-            // TODO: decode ws->buffer
-            write(backend->fd, ws->buffer, ws->len);
+            uint8_t* decoded = NULL;
+            size_t decoded_len = 0;
+            ws_decode_frame(ws->buffer, ws->len, &decoded, &decoded_len);
+            ssize_t w = write(backend->fd, decoded, decoded_len);
+            printf("wrote to backend(%u): %ld/%ld\n",
+                   backend->state,
+                   w,
+                   decoded_len);
+            ws->len = ws->pos = 0;
         } else {
-            printf("TODO: read from state %d\n", ws->state);
+            /*
+            printf("TODO: read from state %d:\n  ", ws->state);
+            for (int i = 0; i < ws->len; i++) {
+                printf("%02x", ws->buffer[i]);
+                if ((i + 1) % 2 == 0) {
+                    printf((i + 1) % 16 == 0 ? "\n  " : " ");
+                }
+            }
+            printf("\n");
+            */
+
+            struct ws_buf* frontend = ws->next;
+            uint8_t encoded[4096];
+            size_t encoded_len = 0;
+            ws_encode_frame(ws->buffer, ws->len, encoded, &encoded_len);
+            printf("encoded: %lu\n", encoded_len);
+            /*
+            for (int i = 0; i < encoded_len; i++) {
+                printf("%02x", encoded[i]);
+                if ((i + 1) % 2 == 0) {
+                    printf((i + 1) % 16 == 0 ? "\n  " : " ");
+                }
+            }
+            */
+            printf("\n");
+
+            ssize_t w = write(frontend->fd, encoded, encoded_len);
+            printf("wrote to frontend(%u): %ld/%ld\n",
+                   frontend->state,
+                   w,
+                   encoded_len);
+            ws->len = ws->pos = 0;
         }
     }
     return true;
 }
 
-static void ws_handle_event(struct epoll_event* event, int epfd) {
+static void ws_handle_event(const struct epoll_event* event, const int epfd) {
     if (event->events & EPOLLIN) {
         if (!ws_frontend_read(event->data.ptr, epfd)) {
             printf("client read failed");
@@ -260,12 +365,18 @@ static void ws_handle_event(struct epoll_event* event, int epfd) {
         if (buf) {
             epoll_ctl(epfd, EPOLL_CTL_DEL, buf->fd, NULL);
             close(buf->fd);
+            struct ws_buf* next = buf->next;
+            if (next) {
+                epoll_ctl(epfd, EPOLL_CTL_DEL, next->fd, NULL);
+                close(next->fd);
+                free(next);
+            }
             free(buf);
         }
     }
 }
 
-static void ws_main_loop(int sockfd, int epfd) {
+static void ws_main_loop(const int sockfd, const int epfd) {
     const int32_t max_events = 64;
     struct epoll_event events[max_events];
     while (true) {
@@ -285,28 +396,7 @@ static void ws_main_loop(int sockfd, int epfd) {
     }
 }
 
-/*
-GET / HTTP/1.1
-Host: localhost:15432
-Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits
-Sec-WebSocket-Key: R8K9Mdoh1XEdhaArqfOywA==
-Sec-WebSocket-Version: 13
-
-HTTP/1.1 101 Switching Protocols
-Connection: Upgrade
-Upgrade: websocket
-Sec-WebSocket-Accept: soqyjZt0XembO52Dht1WJbSs3wI=
- */
 int main(void) {
-
-    const uint8_t frame[]
-        = {0x82, 0xb9, 0x03, 0x5d, 0xc5, 0x49, 0x03, 0x5d, 0xc5, 0x70, 0x03,
-           0x5e, 0xc5, 0x49, 0x60, 0x31, 0xac, 0x2c, 0x6d, 0x29, 0x9a, 0x2c,
-           0x6d, 0x3e, 0xaa, 0x2d, 0x6a, 0x33, 0xa2, 0x49, 0x56, 0x09, 0x83,
-           0x64, 0x3b, 0x5d, 0xa1, 0x28, 0x77, 0x3c, 0xa7, 0x28, 0x70, 0x38,
-           0xc5, 0x3e, 0x66, 0x3f, 0xc5, 0x3c, 0x70, 0x38, 0xb7, 0x49, 0x61,
-           0x2f, 0xaa, 0x3e, 0x70, 0x38, 0xb7, 0x49, 0x03};
-
     int sockfd = 0;
     int epfd = 0;
     if (ws_listen(15432, &sockfd) && ws_create_epoll(sockfd, &epfd)) {
