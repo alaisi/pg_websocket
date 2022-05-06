@@ -45,6 +45,7 @@ static bool ws_handshake_get_header(const char* request,
                                     const char* header_name,
                                     char* value_out,
                                     size_t value_out_len) {
+
     char header[255] = {0};
     sprintf(header, "%.252s: ", header_name);
     for (char* start = strstr(request, crlf); start;
@@ -52,7 +53,7 @@ static bool ws_handshake_get_header(const char* request,
         start += strlen(crlf);
         if (strstr(start, header) == start) {
             const char* end = strstr(start, crlf);
-            if (!end || end - start >= (ssize_t) value_out_len - 1) {
+            if (!end || end - start >= (ssize_t)value_out_len - 1) {
                 break;
             }
             const size_t len = strlen(header);
@@ -65,6 +66,7 @@ static bool ws_handshake_get_header(const char* request,
 
 static bool
 ws_handshake_hash_key(const char* key, char* hash_out, size_t hash_out_len) {
+
     const char* magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     uint8_t hash[20] = {0};
     SHA_CTX ctx = {0};
@@ -75,6 +77,7 @@ ws_handshake_hash_key(const char* key, char* hash_out, size_t hash_out_len) {
 }
 
 static bool ws_listen(const uint16_t port, int* fd_out) {
+
     int sockfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (sockfd < 0) {
         return false;
@@ -99,6 +102,7 @@ static bool ws_listen(const uint16_t port, int* fd_out) {
 }
 
 static bool ws_create_epoll(const int sockfd, int* epfd_out) {
+
     int epfd = epoll_create1(0);
     if (epoll_ctl(epfd,
                   EPOLL_CTL_ADD,
@@ -116,6 +120,7 @@ static bool ws_create_epoll(const int sockfd, int* epfd_out) {
 }
 
 static bool ws_frontend_accept(const int sockfd, const int epfd) {
+
     struct sockaddr_in addr = {0};
     int clientfd = accept4(sockfd,
                            (struct sockaddr*)&addr,
@@ -145,6 +150,7 @@ static bool ws_frontend_accept(const int sockfd, const int epfd) {
 }
 
 static bool ws_frontend_handshake(const struct ws_buf* ws) {
+
     char key[255] = {0};
     if (!strstr((char*)ws->buffer, "\r\n\r\n")
         || !ws_handshake_get_header(
@@ -172,11 +178,11 @@ static bool ws_frontend_handshake(const struct ws_buf* ws) {
 
 static bool
 ws_backend_connect(const struct ws_buf* ws, const int epfd, int* sockfd_out) {
+
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(BACKEND_PORT);
     inet_pton(AF_INET, BACKEND_IP, &addr.sin_addr);
-
     int sockfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (sockfd < 0) {
         return false;
@@ -205,61 +211,60 @@ ws_backend_connect(const struct ws_buf* ws, const int epfd, int* sockfd_out) {
     return true;
 }
 
-static void ws_encode_frame(const uint8_t* data,
-                            const size_t len,
-                            uint8_t* encoded,
-                            size_t* encoded_len) {
+static void
+ws_encode_frame(const uint16_t len, uint8_t* header, uint8_t* header_len) {
 
+    header[0] = 0x80 | 0x02;
     uint8_t offset = 2;
-    encoded[0] = 0x80 | 0x02;
     if (len < 126) {
-        encoded[1] = len;
+        header[1] = len;
     } else {
-        encoded[1] = 126;
-        encoded[2] = len >> 8;
-        encoded[3] = len & 0xff;
+        header[1] = 126;
+        header[2] = len >> 8;
+        header[3] = len & 0xff;
         offset += 2;
     }
-    memcpy(encoded + offset, data, len);
-    *encoded_len = len + offset;
+    *header_len = offset;
+}
 
-    /*
+static bool ws_decode_frame(uint8_t* encoded,
+                            const size_t len,
+                            uint8_t** decoded_out,
+                            uint16_t* decoded_len) {
     uint8_t fin = encoded[0] & 0x80;
     uint8_t opcode = encoded[0] & 0x0f;
     uint8_t mask = encoded[1] & 0x80;
-    uint8_t len1 = encoded[1] & 0x7F;
-    printf("FIN: %u\n", fin != 0);
-    printf("opcode binary: %u\n", opcode == 0x02);
-    printf("mask: %u\n", mask != 0);
-    printf("len1: %u / %lu\n", len1, len);
-    */
-}
-
-static void ws_decode_frame(uint8_t* frame,
-                            const size_t len,
-                            uint8_t** decoded_out,
-                            size_t* decoded_len) {
-    uint8_t fin = frame[0] & 0x80;
-    uint8_t opcode = frame[0] & 0x0f;
-    uint8_t mask = frame[1] & 0x80;
-    uint16_t len1 = (uint8_t)(frame[1] & 0x7F);
+    uint16_t data_len = (uint8_t)(encoded[1] & 0x7F);
+    if (!fin || !mask || opcode != 0x02 || data_len > 126) {
+        printf("invalid websocket frame: (f=%u,o=%u,m=%u,l=%u)\n",
+               fin,
+               opcode,
+               mask,
+               data_len);
+        return false;
+    }
     uint8_t offset = 6;
-    if (len1 > 125) {
+    if (data_len == 126) {
+        data_len = (encoded[2] << 8) | encoded[3];
         offset += 2;
-        len1 = (frame[2] << 8) | frame[3];
     }
-    for (uint16_t i = 0; i < len1 && offset + i < len; i++) {
-        frame[offset + i] ^= (frame + (offset - 4))[i % 4];
+    if (offset + data_len > len) {
+        printf("len outside buffer (%u + %u / %lu)\n", offset, data_len, len);
+        return false;
     }
-    *decoded_out = frame + offset;
-    *decoded_len = len1;
+    for (uint16_t i = 0; i < data_len; i++) {
+        encoded[offset + i] ^= (encoded + (offset - 4))[i % 4];
+    }
+    *decoded_out = encoded + offset;
+    *decoded_len = data_len;
+    return true;
 
     /*
     printf("FIN: %u\n", fin != 0);
     printf("opcode binary: %u\n", opcode == 0x02);
     printf("mask: %u\n", mask != 0);
     printf("len1: %u\n", len1);
-    
+
     printf("masking key: %02x%02x%02x%02x\n",
            frame[2],
            frame[3],
@@ -280,10 +285,10 @@ static bool ws_frontend_read(struct ws_buf* ws, const int epfd) {
     while (true) {
         ssize_t len = read(
             ws->fd, ws->buffer + ws->len, sizeof(ws->buffer) - ws->len - 1);
-        printf("client read %ld (from %ld)\n", len, ws->len);
         if (len <= 0) {
             break;
         }
+        printf("client read %ld (from %ld)\n", len, ws->len);
         ws->len += len;
         ws->buffer[ws->len] = 0;
 
@@ -304,46 +309,27 @@ static bool ws_frontend_read(struct ws_buf* ws, const int epfd) {
         } else if (ws->state == WS_FE_CONNECTED) {
             struct ws_buf* backend = ws->next;
             uint8_t* decoded = NULL;
-            size_t decoded_len = 0;
-            ws_decode_frame(ws->buffer, ws->len, &decoded, &decoded_len);
-            ssize_t w = write(backend->fd, decoded, decoded_len);
-            printf("wrote to backend(%u): %ld/%ld\n",
-                   backend->state,
-                   w,
-                   decoded_len);
-            ws->len = ws->pos = 0;
+            uint16_t decoded_len = 0;
+            if (ws_decode_frame(ws->buffer, ws->len, &decoded, &decoded_len)) {
+                ssize_t w = write(backend->fd, decoded, decoded_len);
+                printf("wrote to backend(%u): %ld/%u\n",
+                       backend->state,
+                       w,
+                       decoded_len);
+                ws->len = ws->pos = 0;
+            }
         } else {
-            /*
-            printf("TODO: read from state %d:\n  ", ws->state);
-            for (int i = 0; i < ws->len; i++) {
-                printf("%02x", ws->buffer[i]);
-                if ((i + 1) % 2 == 0) {
-                    printf((i + 1) % 16 == 0 ? "\n  " : " ");
-                }
-            }
-            printf("\n");
-            */
-
             struct ws_buf* frontend = ws->next;
-            uint8_t encoded[4096];
-            size_t encoded_len = 0;
-            ws_encode_frame(ws->buffer, ws->len, encoded, &encoded_len);
-            printf("encoded: %lu\n", encoded_len);
-            /*
-            for (int i = 0; i < encoded_len; i++) {
-                printf("%02x", encoded[i]);
-                if ((i + 1) % 2 == 0) {
-                    printf((i + 1) % 16 == 0 ? "\n  " : " ");
-                }
-            }
-            */
-            printf("\n");
-
-            ssize_t w = write(frontend->fd, encoded, encoded_len);
-            printf("wrote to frontend(%u): %ld/%ld\n",
+            uint8_t header[4];
+            uint8_t header_len = 0;
+            ws_encode_frame(ws->len, header, &header_len);
+            ssize_t w1 = write(frontend->fd, header, header_len);
+            ssize_t w2 = write(frontend->fd, ws->buffer, ws->len);
+            printf("wrote to frontend(%u): %ld+%ld/%lu\n",
                    frontend->state,
-                   w,
-                   encoded_len);
+                   w1,
+                   w2,
+                   header_len + ws->len);
             ws->len = ws->pos = 0;
         }
     }
