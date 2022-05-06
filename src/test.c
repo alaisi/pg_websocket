@@ -151,8 +151,14 @@ static bool ws_frontend_accept(const int sockfd, const int epfd) {
 
 static bool ws_frontend_handshake(const struct ws_buf* ws) {
 
+    char protocol[255] = {0};
     char key[255] = {0};
     if (!strstr((char*)ws->buffer, "\r\n\r\n")
+        || !ws_handshake_get_header((char*)ws->buffer,
+                                    "Sec-WebSocket-Protocol",
+                                    protocol,
+                                    sizeof(protocol))
+        || strcmp("binary", protocol)
         || !ws_handshake_get_header(
             (char*)ws->buffer, "Sec-WebSocket-Key", key, sizeof(key))) {
         return false;
