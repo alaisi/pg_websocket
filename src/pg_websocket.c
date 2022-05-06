@@ -7,11 +7,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "fmgr.h"
-#include "postgres.h"
-#include "postmaster/bgworker.h"
-#include "postmaster/postmaster.h"
-#include "utils/guc.h"
+#include <postgres.h>
+#include <postmaster/bgworker.h>
+#include <utils/guc.h>
 
 PG_MODULE_MAGIC;
 
@@ -47,4 +45,6 @@ void _PG_init(void) {
     RegisterBackgroundWorker(&worker);
 }
 
-void _PG_fini(void) { ereport(LOG, (errmsg("pg_websocket stopped"))); }
+void _PG_fini(void) {
+    ereport(LOG, (errmsg("pg_websocket stopped")));
+}
