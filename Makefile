@@ -17,5 +17,5 @@ standalone: $(OBJS)
 
 format:
 	@clang-format --verbose -i \
-		-style='{BasedOnStyle: llvm, IndentWidth: 4, ColumnLimit: 80, AlignOperands: Align, AlignAfterOpenBracket: Align, AllowShortFunctionsOnASingleLine: None, BreakBeforeBinaryOperators: true, BinPackParameters: false, BinPackArguments: false, PenaltyReturnTypeOnItsOwnLine: 99, PenaltyBreakBeforeFirstCallParameter: 99, PointerAlignment: Left, SpaceAfterCStyleCast: true}' \
+		-style='{BasedOnStyle: llvm, IndentWidth: 4, ColumnLimit: 80, AlignOperands: Align, AlignAfterOpenBracket: Align, AllowShortFunctionsOnASingleLine: None, BreakBeforeBinaryOperators: true, BinPackParameters: false, BinPackArguments: false, IndentCaseLabels: true, PenaltyReturnTypeOnItsOwnLine: 99, PenaltyBreakBeforeFirstCallParameter: 99, PointerAlignment: Left, SpaceAfterCStyleCast: true}' \
 		src/*.c

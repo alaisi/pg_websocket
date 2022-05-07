@@ -22,6 +22,7 @@ typedef enum {
     WS_FE_HANDSHAKE,
     WS_FE_CONNECTED,
     WS_BE_CONNECTED,
+    WS_CLOSING
 } ws_state;
 
 struct ws_buf {
@@ -46,17 +47,17 @@ static bool ws_flush(struct ws_conn* ws) {
         ssize_t sent = write(ws->fd, ws->write_buf.buffer, len);
         if (sent < 1) {
             const int err = errno;
-            if (err == EAGAIN) {
+            if (err == EWOULDBLOCK) {
                 break;
             }
             printf("write: %s\n", strerror(err));
             return false;
         }
-        if (sent == (ssize_t) len) {
-            ws->write_buf.len = 0;
-            break;
+        if (sent < (ssize_t) len) {
+            memmove(ws->write_buf.buffer,
+                    ws->write_buf.buffer + sent,
+                    len - sent);
         }
-        memmove(ws->write_buf.buffer, ws->write_buf.buffer + sent, len - sent);
         len = ws->write_buf.len = len - sent;
     }
     return true;
@@ -78,7 +79,7 @@ static bool ws_recv(struct ws_conn* ws, uint16_t* len_out) {
                        sizeof(ws->read_buf.buffer) - ws->read_buf.len - 1);
     if (len < 0) {
         const int err = errno;
-        if (err == EAGAIN) {
+        if (err == EWOULDBLOCK) {
             return true;
         }
         printf("read: %s\n", strerror(err));
@@ -88,21 +89,6 @@ static bool ws_recv(struct ws_conn* ws, uint16_t* len_out) {
     ws->read_buf.buffer[ws->read_buf.len] = 0;
     *len_out = len;
     return true;
-}
-
-static void ws_close(struct ws_conn* ws, int epfd) {
-    if (epoll_ctl(epfd, EPOLL_CTL_DEL, ws->fd, NULL)) {
-        perror("epoll_ctl");
-    }
-    close(ws->fd);
-    if (ws->target) {
-        if (epoll_ctl(epfd, EPOLL_CTL_DEL, ws->target->fd, NULL)) {
-            perror("epoll_ctl");
-        }
-        close(ws->target->fd);
-        free(ws->target);
-    }
-    free(ws);
 }
 
 static bool ws_handshake_get_header(const char* request,
@@ -166,6 +152,7 @@ static bool ws_handshake(struct ws_conn* ws) {
                                  "Content-Length: 0\r\n"
                                  "Connection: close\r\n\r\n";
         ws_send(ws, (uint8_t*) http_error, strlen(http_error));
+        ws->state = WS_CLOSING;
         return false;
     }
 
@@ -183,8 +170,13 @@ static bool ws_handshake(struct ws_conn* ws) {
 static bool ws_frame_decode(uint8_t* encoded,
                             const size_t len,
                             uint8_t** decoded_out,
-                            uint16_t* decoded_len) {
+                            uint16_t* decoded_len,
+                            uint16_t* header_len) {
 
+    *decoded_len = *header_len = 0;
+    if (len < 2) {
+        return true;
+    }
     uint8_t fin = encoded[0] & 0x80;
     uint8_t opcode = encoded[0] & 0x0f;
     uint8_t mask = encoded[1] & 0x80;
@@ -199,18 +191,21 @@ static bool ws_frame_decode(uint8_t* encoded,
     }
     uint8_t offset = 6;
     if (data_len == 126) {
+        if (len < 4) {
+            return true;
+        }
         data_len = (encoded[2] << 8) | encoded[3];
         offset += 2;
     }
     if (offset + data_len > len) {
-        printf("len outside buffer (%u + %u / %lu)\n", offset, data_len, len);
-        return false;
+        return true;
     }
     for (uint16_t i = 0; i < data_len; i++) {
         encoded[offset + i] ^= (encoded + (offset - 4))[i % 4];
     }
     *decoded_out = encoded + offset;
     *decoded_len = data_len;
+    *header_len = offset;
     return true;
 }
 
@@ -267,6 +262,65 @@ static bool ws_backend_connect(const struct ws_conn* ws,
     return true;
 }
 
+static bool ws_handshake_complete(struct ws_conn* ws, const int epfd) {
+    ws->state = WS_FE_CONNECTED;
+    ws->read_buf.len = 0;
+    struct ws_conn* backend = calloc(1, sizeof(struct ws_conn));
+    if (!ws_backend_connect(backend, epfd, &backend->fd)) {
+        free(backend);
+        return false;
+    }
+    backend->state = WS_BE_CONNECTED;
+    backend->read_buf.len = 0;
+    backend->write_buf.len = 0;
+    backend->target = ws;
+    ws->target = backend;
+    return true;
+}
+
+static bool ws_send_to_backend(struct ws_conn* ws) {
+    struct ws_conn* backend = ws->target;
+    uint8_t* decoded = NULL;
+    uint16_t decoded_len = 0;
+    uint16_t header_len = 0;
+    while (true) {
+        if (!ws_frame_decode(ws->read_buf.buffer, //
+                             ws->read_buf.len,
+                             &decoded,
+                             &decoded_len,
+                             &header_len)) {
+            return false;
+        }
+        if (decoded_len == 0) {
+            return true;
+        }
+        if (!ws_send(backend, decoded, decoded_len)) {
+            return false;
+        }
+        uint16_t remaining = ws->read_buf.len - header_len - decoded_len;
+        if (remaining > 0) {
+            memmove(ws->read_buf.buffer,
+                    ws->read_buf.buffer + header_len + decoded_len,
+                    remaining);
+        }
+        ws->read_buf.len = remaining;
+    }
+    return true;
+}
+
+static bool ws_send_to_frontend(struct ws_conn* ws) {
+    struct ws_conn* frontend = ws->target;
+    uint8_t header[4];
+    uint8_t header_len = 0;
+    ws_frame_encode_header(ws->read_buf.len, header, &header_len);
+    if (!ws_send(frontend, header, header_len)
+        || !ws_send(frontend, ws->read_buf.buffer, ws->read_buf.len)) {
+        return false;
+    }
+    ws->read_buf.len = 0;
+    return true;
+}
+
 static bool ws_handle_read_event(struct ws_conn* ws, const int epfd) {
 
     while (true) {
@@ -275,51 +329,44 @@ static bool ws_handle_read_event(struct ws_conn* ws, const int epfd) {
             return false;
         }
         if (len == 0) {
-            break;
+            return true;
         }
-        printf("client read %u\n", len);
-
-        if (ws->state == WS_FE_HANDSHAKE) {
-            if (ws_handshake(ws)) {
-                ws->state = WS_FE_CONNECTED;
-                ws->read_buf.len = 0;
-                struct ws_conn* backend = calloc(1, sizeof(struct ws_conn));
-                if (!ws_backend_connect(backend, epfd, &backend->fd)) {
-                    free(backend);
+        switch (ws->state) {
+            case WS_FE_HANDSHAKE:
+                if (ws_handshake(ws) && !ws_handshake_complete(ws, epfd)) {
                     return false;
                 }
-                backend->state = WS_BE_CONNECTED;
-                backend->read_buf.len = 0;
-                backend->write_buf.len = 0;
-                backend->target = ws;
-                ws->target = backend;
-            }
-        } else if (ws->state == WS_FE_CONNECTED) {
-            struct ws_conn* backend = ws->target;
-            uint8_t* decoded = NULL;
-            uint16_t decoded_len = 0;
-            if (ws_frame_decode(ws->read_buf.buffer,
-                                ws->read_buf.len,
-                                &decoded,
-                                &decoded_len)) {
-                if (!ws_send(backend, decoded, decoded_len)) {
+                continue;
+            case WS_FE_CONNECTED:
+                if (!ws_send_to_backend(ws)) {
                     return false;
                 }
-                ws->read_buf.len = 0;
-            }
-        } else {
-            struct ws_conn* frontend = ws->target;
-            uint8_t header[4];
-            uint8_t header_len = 0;
-            ws_frame_encode_header(ws->read_buf.len, header, &header_len);
-            if (!ws_send(frontend, header, header_len)
-                || !ws_send(frontend, ws->read_buf.buffer, ws->read_buf.len)) {
+                continue;
+            case WS_BE_CONNECTED:
+                if (!ws_send_to_frontend(ws)) {
+                    return false;
+                }
+                continue;
+            case WS_CLOSING:
                 return false;
-            }
-            ws->read_buf.len = 0;
         }
     }
     return true;
+}
+
+static void ws_close(struct ws_conn* ws, int epfd) {
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, ws->fd, NULL)) {
+        perror("epoll_ctl");
+    }
+    close(ws->fd);
+    if (ws->target) {
+        if (epoll_ctl(epfd, EPOLL_CTL_DEL, ws->target->fd, NULL)) {
+            perror("epoll_ctl");
+        }
+        close(ws->target->fd);
+        free(ws->target);
+    }
+    free(ws);
 }
 
 static void ws_handle_client_event(const struct epoll_event* event,
@@ -327,20 +374,24 @@ static void ws_handle_client_event(const struct epoll_event* event,
 
     struct ws_conn* ws = event->data.ptr;
     if (event->events & EPOLLIN) {
+        printf("  EPOLLIN\n");
         if (!ws_handle_read_event(ws, epfd)) {
             printf("client read failed\n");
-            ws_close(ws, epfd);
+            ws->state = WS_CLOSING;
             return;
         }
     }
     if (event->events & EPOLLOUT) {
+        printf("  EPOLLOUT\n");
         if (!ws_flush(ws)) {
             printf("client write failed\n");
-            ws_close(ws, epfd);
+            ws->state = WS_CLOSING;
             return;
         }
     }
-    if (event->events & (EPOLLRDHUP | EPOLLHUP)) {
+    if (event->events & (EPOLLRDHUP | EPOLLHUP) //
+        || ws->state == WS_CLOSING) {
+        printf("  CLOSE\n");
         printf("close event\n");
         ws_close(ws, epfd);
     }
