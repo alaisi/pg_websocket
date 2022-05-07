@@ -12,9 +12,6 @@ PGXS := $(shell $(PG_CONFIG) --pgxs)
 INCLUDEDIR = $(shell $(PG_CONFIG) --includedir-server)
 include $(PGXS)
 
-standalone: $(OBJS)
-	$(CC) -o test $(OBJS) -L$(shell $(PG_CONFIG) --pkglibdir)  $(SHLIB_LINK) -lpgcommon
-
 format:
 	@clang-format --verbose -i \
 		-style='{BasedOnStyle: llvm, IndentWidth: 4, ColumnLimit: 80, AlignOperands: Align, AlignAfterOpenBracket: Align, AllowShortFunctionsOnASingleLine: None, BreakBeforeBinaryOperators: true, BinPackParameters: false, BinPackArguments: false, IndentCaseLabels: true, PenaltyReturnTypeOnItsOwnLine: 99, PenaltyBreakBeforeFirstCallParameter: 99, PointerAlignment: Left, SpaceAfterCStyleCast: true}' \
