@@ -52,7 +52,7 @@ static bool ws_flush(struct ws_conn* ws) {
 
     for (uint16_t len = ws->write_buf.len; len > 0;) {
         ssize_t sent = write(ws->fd, ws->write_buf.buffer, len);
-        if (sent < 1) {
+        if (sent < 0) {
             const int err = errno;
             if (err == EWOULDBLOCK) {
                 break;
@@ -303,7 +303,7 @@ static bool ws_handle_frontend_read(struct ws_conn* ws) {
     uint8_t* decoded = NULL;
     uint16_t decoded_len = 0;
     uint16_t header_len = 0;
-    while (true) {
+    while (ws->read_buf.len > 0) {
         if (!ws_frame_decode(ws->read_buf.buffer,
                              ws->read_buf.len,
                              &opcode,
@@ -322,8 +322,7 @@ static bool ws_handle_frontend_read(struct ws_conn* ws) {
             if (!ws_send(ws->target, decoded, decoded_len)) {
                 return false;
             }
-        }
-        if (opcode == WS_OP_PING) {
+        } else if (opcode == WS_OP_PING) {
             if (!ws_send_ping_response(ws, decoded, decoded_len)) {
                 return false;
             }
@@ -365,24 +364,18 @@ static bool ws_handle_read_event(struct ws_conn* ws, const int epfd) {
         if (len == 0) {
             return true;
         }
-        switch (ws->state) {
-            case WS_FRONTEND_HANDSHAKE:
-                if (ws_handshake(ws) && !ws_handshake_complete(ws, epfd)) {
-                    return false;
-                }
-                continue;
-            case WS_FRONTEND_CONNECTED:
-                if (!ws_handle_frontend_read(ws)) {
-                    return false;
-                }
-                continue;
-            case WS_BACKEND_CONNECTED:
-                if (!ws_send_to_frontend(ws)) {
-                    return false;
-                }
-                continue;
-            case WS_CLOSING:
+        if (ws->state == WS_FRONTEND_HANDSHAKE) {
+            if (ws_handshake(ws) && !ws_handshake_complete(ws, epfd)) {
                 return false;
+            }
+        } else if (ws->state == WS_FRONTEND_CONNECTED) {
+            if (!ws_handle_frontend_read(ws)) {
+                return false;
+            }
+        } else if (ws->state == WS_BACKEND_CONNECTED) {
+            if (!ws_send_to_frontend(ws)) {
+                return false;
+            }
         }
     }
     return true;
@@ -412,19 +405,16 @@ static void ws_handle_client_event(const struct epoll_event* event,
         if (!ws_handle_read_event(ws, epfd)) {
             printf("client read failed\n");
             ws->state = WS_CLOSING;
-            return;
         }
     }
-    if (event->events & EPOLLOUT) {
+    if (event->events & EPOLLOUT && ws->state != WS_CLOSING) {
         printf("  EPOLLOUT\n");
         if (!ws_flush(ws)) {
             printf("client write failed\n");
             ws->state = WS_CLOSING;
-            return;
         }
     }
-    if (event->events & (EPOLLRDHUP | EPOLLHUP) //
-        || ws->state == WS_CLOSING) {
+    if (event->events & (EPOLLRDHUP | EPOLLHUP) || ws->state == WS_CLOSING) {
         printf("  CLOSE\n");
         printf("close event\n");
         ws_close(ws, epfd);
