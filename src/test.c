@@ -19,17 +19,24 @@
 #define MAX_EVENTS 128
 
 typedef enum {
-    WS_FE_HANDSHAKE,
-    WS_FE_CONNECTED,
-    WS_BE_CONNECTED,
-    WS_CLOSING
+    WS_OP_NONE = 0x00,
+    WS_OP_DATA_BINARY = 0x02,
+    WS_OP_CLOSE = 0x08,
+    WS_OP_PING = 0x09,
+    WS_OP_PONG = 0x0A,
+} ws_opcode;
+
+typedef enum {
+    WS_FRONTEND_HANDSHAKE,
+    WS_FRONTEND_CONNECTED,
+    WS_BACKEND_CONNECTED,
+    WS_CLOSING,
 } ws_state;
 
 struct ws_buf {
     uint8_t buffer[8192];
     uint16_t len;
 };
-
 struct ws_conn {
     ws_state state;
     int fd;
@@ -74,6 +81,7 @@ static bool ws_send(struct ws_conn* ws, uint8_t* data, uint16_t data_len) {
 }
 
 static bool ws_recv(struct ws_conn* ws, uint16_t* len_out) {
+
     ssize_t len = read(ws->fd,
                        ws->read_buf.buffer + ws->read_buf.len,
                        sizeof(ws->read_buf.buffer) - ws->read_buf.len - 1);
@@ -169,6 +177,7 @@ static bool ws_handshake(struct ws_conn* ws) {
 
 static bool ws_frame_decode(uint8_t* encoded,
                             const size_t len,
+                            uint8_t* opcode_out,
                             uint8_t** decoded_out,
                             uint16_t* decoded_len,
                             uint16_t* header_len) {
@@ -179,13 +188,13 @@ static bool ws_frame_decode(uint8_t* encoded,
     }
     uint8_t fin = encoded[0] & 0x80;
     uint8_t opcode = encoded[0] & 0x0f;
-    uint8_t mask = encoded[1] & 0x80;
+    uint8_t masked = encoded[1] & 0x80;
     uint16_t data_len = encoded[1] & 0x7F;
-    if (!fin || !mask || opcode != 0x02 || data_len > 126) {
+    if (!masked || data_len > 126) {
         printf("invalid websocket frame: (f=%u,o=%u,m=%u,l=%u)\n",
                fin,
                opcode,
-               mask,
+               masked,
                data_len);
         return false;
     }
@@ -203,6 +212,7 @@ static bool ws_frame_decode(uint8_t* encoded,
     for (uint16_t i = 0; i < data_len; i++) {
         encoded[offset + i] ^= (encoded + (offset - 4))[i % 4];
     }
+    *opcode_out = opcode;
     *decoded_out = encoded + offset;
     *decoded_len = data_len;
     *header_len = offset;
@@ -210,10 +220,11 @@ static bool ws_frame_decode(uint8_t* encoded,
 }
 
 static void ws_frame_encode_header(const uint16_t len,
+                                   ws_opcode opcode,
                                    uint8_t* header,
                                    uint8_t* header_len) {
 
-    header[0] = 0x80 | 0x02;
+    header[0] = 0x80 | opcode;
     uint8_t offset = 2;
     if (len < 126) {
         header[1] = len;
@@ -263,14 +274,14 @@ static bool ws_backend_connect(const struct ws_conn* ws,
 }
 
 static bool ws_handshake_complete(struct ws_conn* ws, const int epfd) {
-    ws->state = WS_FE_CONNECTED;
+    ws->state = WS_FRONTEND_CONNECTED;
     ws->read_buf.len = 0;
     struct ws_conn* backend = calloc(1, sizeof(struct ws_conn));
     if (!ws_backend_connect(backend, epfd, &backend->fd)) {
         free(backend);
         return false;
     }
-    backend->state = WS_BE_CONNECTED;
+    backend->state = WS_BACKEND_CONNECTED;
     backend->read_buf.len = 0;
     backend->write_buf.len = 0;
     backend->target = ws;
@@ -278,24 +289,44 @@ static bool ws_handshake_complete(struct ws_conn* ws, const int epfd) {
     return true;
 }
 
-static bool ws_send_to_backend(struct ws_conn* ws) {
-    struct ws_conn* backend = ws->target;
+static bool ws_send_ping_response(struct ws_conn* ws,
+                                  uint8_t* data,
+                                  uint16_t data_len) {
+    uint8_t header[4];
+    uint8_t header_len = 0;
+    ws_frame_encode_header(ws->read_buf.len, WS_OP_PONG, header, &header_len);
+    return ws_send(ws, header, header_len) && ws_send(ws, data, data_len);
+}
+
+static bool ws_handle_frontend_read(struct ws_conn* ws) {
+    uint8_t opcode = 0;
     uint8_t* decoded = NULL;
     uint16_t decoded_len = 0;
     uint16_t header_len = 0;
     while (true) {
-        if (!ws_frame_decode(ws->read_buf.buffer, //
+        if (!ws_frame_decode(ws->read_buf.buffer,
                              ws->read_buf.len,
+                             &opcode,
                              &decoded,
                              &decoded_len,
                              &header_len)) {
             return false;
         }
-        if (decoded_len == 0) {
+        if (header_len == 0) {
             return true;
         }
-        if (!ws_send(backend, decoded, decoded_len)) {
+        if (opcode == WS_OP_CLOSE) {
             return false;
+        }
+        if (opcode == WS_OP_DATA_BINARY || opcode == WS_OP_NONE) {
+            if (!ws_send(ws->target, decoded, decoded_len)) {
+                return false;
+            }
+        }
+        if (opcode == WS_OP_PING) {
+            if (!ws_send_ping_response(ws, decoded, decoded_len)) {
+                return false;
+            }
         }
         uint16_t remaining = ws->read_buf.len - header_len - decoded_len;
         if (remaining > 0) {
@@ -312,7 +343,10 @@ static bool ws_send_to_frontend(struct ws_conn* ws) {
     struct ws_conn* frontend = ws->target;
     uint8_t header[4];
     uint8_t header_len = 0;
-    ws_frame_encode_header(ws->read_buf.len, header, &header_len);
+    ws_frame_encode_header(ws->read_buf.len,
+                           WS_OP_DATA_BINARY,
+                           header,
+                           &header_len);
     if (!ws_send(frontend, header, header_len)
         || !ws_send(frontend, ws->read_buf.buffer, ws->read_buf.len)) {
         return false;
@@ -332,17 +366,17 @@ static bool ws_handle_read_event(struct ws_conn* ws, const int epfd) {
             return true;
         }
         switch (ws->state) {
-            case WS_FE_HANDSHAKE:
+            case WS_FRONTEND_HANDSHAKE:
                 if (ws_handshake(ws) && !ws_handshake_complete(ws, epfd)) {
                     return false;
                 }
                 continue;
-            case WS_FE_CONNECTED:
-                if (!ws_send_to_backend(ws)) {
+            case WS_FRONTEND_CONNECTED:
+                if (!ws_handle_frontend_read(ws)) {
                     return false;
                 }
                 continue;
-            case WS_BE_CONNECTED:
+            case WS_BACKEND_CONNECTED:
                 if (!ws_send_to_frontend(ws)) {
                     return false;
                 }
@@ -411,7 +445,7 @@ static bool ws_handle_server_event(const int sockfd, const int epfd) {
     printf("client connected\n");
     struct ws_conn* ws = calloc(1, sizeof(struct ws_conn));
     ws->fd = clientfd;
-    ws->state = WS_FE_HANDSHAKE;
+    ws->state = WS_FRONTEND_HANDSHAKE;
     ws->read_buf.len = 0;
     ws->write_buf.len = 0;
     if (epoll_ctl(epfd,
