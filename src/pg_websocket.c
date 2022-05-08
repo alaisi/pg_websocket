@@ -422,22 +422,22 @@ static void ws_close(struct ws_conn* ws, const int epfd) {
     free(ws);
 }
 
-static bool ws_handle_client_event(const struct epoll_event* event,
+static bool ws_handle_client_event(struct ws_conn* ws,
+                                   const uint32_t events,
                                    const int epfd) {
-    struct ws_conn* ws = event->data.ptr;
-    if (event->events & EPOLLIN) {
+    if (events & EPOLLIN) {
         if (!ws_handle_read_event(ws, epfd)) {
             ws->state = WS_CLOSING;
             return false;
         }
     }
-    if (event->events & EPOLLOUT && ws->state != WS_CLOSING) {
+    if (events & EPOLLOUT && ws->state != WS_CLOSING) {
         if (!ws_flush(ws)) {
             ws->state = WS_CLOSING;
             return false;
         }
     }
-    if (event->events & (EPOLLRDHUP | EPOLLHUP)) {
+    if (events & (EPOLLRDHUP | EPOLLHUP)) {
         ws->state = WS_CLOSING;
         return false;
     }
@@ -499,12 +499,13 @@ static void ws_main_loop(const int sockfd, const int epfd) {
                     break;
                 }
             }
-            if (conn_id && !ws_handle_client_event(&events[i], epfd)) {
+            if (conn_id
+                && !ws_handle_client_event(ws, events[i].events, epfd)) {
                 closed_conns[closed_len++] = conn_id;
                 if (ws->target) {
                     closed_conns[closed_len++] = (uint64_t) ws->target;
                 }
-                ws_close(events[i].data.ptr, epfd);
+                ws_close(ws, epfd);
             }
         }
     }
