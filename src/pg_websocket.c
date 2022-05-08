@@ -1,6 +1,6 @@
-
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netdb.h>
 #include <netinet/ip.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -13,16 +13,12 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include <postgres.h>
+#include <openssl/sha.h>
 
 #include <common/base64.h>
-#include <fmgr.h>
-#include <openssl/sha.h>
+#include <postgres.h>
 #include <postmaster/bgworker.h>
-
-#define BACKEND_PORT 5432
-#define BACKEND_IP "127.0.0.1"
-#define MAX_EVENTS 128
+#include <utils/guc.h>
 
 PG_MODULE_MAGIC;
 void _PG_init(void);
@@ -55,8 +51,10 @@ struct ws_conn {
     struct ws_conn* target;
 };
 
-const char* crlf = "\r\n";
-const char* rfc_magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+// set from postgresql.conf:
+static char* config_listen_port = NULL;
+static char* config_backend_port = NULL;
+static char* config_backend_host = NULL;
 
 static bool ws_flush(struct ws_conn* ws) {
     for (uint16_t len = ws->write_buf.len; len > 0;) {
@@ -114,6 +112,7 @@ static bool ws_handshake_get_header(const char* request,
                                     size_t value_out_len) {
     char header[255] = {0};
     sprintf(header, "%.252s: ", header_name);
+    const char* crlf = "\r\n";
     for (char* start = strstr(request, crlf); start;
          start = strstr(start, crlf)) {
         start += strlen(crlf);
@@ -133,6 +132,7 @@ static bool ws_handshake_get_header(const char* request,
 static bool ws_handshake_hash_key(const char* key,
                                   char* hash_out,
                                   size_t hash_out_len) {
+    const char* rfc_magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     uint8_t hash[20] = {0};
     SHA_CTX ctx = {0};
     return SHA1_Init(&ctx)                                    //
@@ -246,38 +246,54 @@ static void ws_frame_encode_header(const uint16_t len,
 static bool ws_backend_connect(const struct ws_conn* ws,
                                const int epfd,
                                int* sockfd_out) {
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(BACKEND_PORT);
-    inet_pton(AF_INET, BACKEND_IP, &addr.sin_addr);
-    int sockfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    if (sockfd < 0) {
+
+    struct addrinfo hints = {0};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = 0;
+    struct addrinfo* addr = NULL;
+    int err = getaddrinfo(config_backend_host, //
+                          config_backend_port,
+                          &hints,
+                          &addr);
+    if (err) {
+        ereport(WARNING,
+                errmsg("pg_websocket backend host '%s' not found: %s",
+                       config_backend_host,
+                       gai_strerror(err)));
         return false;
     }
-    if (connect(sockfd, (struct sockaddr*) &addr, sizeof(addr))) {
-        const int err = errno;
-        if (err != EINPROGRESS) {
+
+    int sockfd = socket(addr->ai_family,
+                        SOCK_STREAM | SOCK_NONBLOCK,
+                        addr->ai_protocol);
+    if (sockfd < 0 || connect(sockfd, addr->ai_addr, addr->ai_addrlen)) {
+        err = errno;
+        if (!(sockfd > 0 && err == EINPROGRESS)) {
             ereport(WARNING,
                     errmsg("pg_websocket backend connect: %s", strerror(err)));
-            close(sockfd);
+            freeaddrinfo(addr);
+            if (sockfd > 0) {
+                close(sockfd);
+            }
             return false;
         }
     }
+    freeaddrinfo(addr);
     if (epoll_ctl(epfd,
                   EPOLL_CTL_ADD,
                   sockfd,
                   &(struct epoll_event){
-                      .events
-                      = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP | EPOLLHUP,
+                      .events = EPOLLIN | EPOLLOUT | EPOLLET //
+                                | EPOLLRDHUP | EPOLLHUP,
                       .data.ptr = (void*) ws,
                   })) {
-        const int err = errno;
+        err = errno;
         ereport(WARNING,
                 errmsg("pg_websocket backend epoll: %s", strerror(err)));
         close(sockfd);
         return false;
     }
-    printf("connected to backend\n");
     *sockfd_out = sockfd;
     return true;
 }
@@ -406,27 +422,29 @@ static void ws_close(struct ws_conn* ws, const int epfd) {
     free(ws);
 }
 
-static void ws_handle_client_event(const struct epoll_event* event,
+static bool ws_handle_client_event(const struct epoll_event* event,
                                    const int epfd) {
     struct ws_conn* ws = event->data.ptr;
     if (event->events & EPOLLIN) {
         if (!ws_handle_read_event(ws, epfd)) {
             ws->state = WS_CLOSING;
+            return false;
         }
     }
     if (event->events & EPOLLOUT && ws->state != WS_CLOSING) {
         if (!ws_flush(ws)) {
             ws->state = WS_CLOSING;
+            return false;
         }
     }
-    if (event->events & (EPOLLRDHUP | EPOLLHUP) || ws->state == WS_CLOSING) {
-        ereport(DEBUG1, errmsg("pg_websocket client closed"));
-        ws_close(ws, epfd);
+    if (event->events & (EPOLLRDHUP | EPOLLHUP)) {
+        ws->state = WS_CLOSING;
+        return false;
     }
+    return true;
 }
 
 static void ws_handle_server_event(const int sockfd, const int epfd) {
-
     struct sockaddr_in addr = {0};
     int clientfd = accept4(sockfd,
                            (struct sockaddr*) &addr,
@@ -437,7 +455,6 @@ static void ws_handle_server_event(const int sockfd, const int epfd) {
         ereport(WARNING, errmsg("pg_websocket accept: %s", strerror(err)));
         return;
     }
-    printf("client connected\n");
     struct ws_conn* ws = calloc(1, sizeof(struct ws_conn));
     ws->fd = clientfd;
     ws->state = WS_FRONTEND_HANDSHAKE;
@@ -447,8 +464,8 @@ static void ws_handle_server_event(const int sockfd, const int epfd) {
                   EPOLL_CTL_ADD,
                   clientfd,
                   &(struct epoll_event){
-                      .events
-                      = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP | EPOLLHUP,
+                      .events = EPOLLIN | EPOLLOUT | EPOLLET //
+                                | EPOLLRDHUP | EPOLLHUP,
                       .data.ptr = ws,
                   })) {
         const int err = errno;
@@ -459,19 +476,35 @@ static void ws_handle_server_event(const int sockfd, const int epfd) {
 }
 
 static void ws_main_loop(const int sockfd, const int epfd) {
-    struct epoll_event events[MAX_EVENTS];
+    struct epoll_event events[64];
+    uint64_t closed_conns[64 * 2];
     while (true) {
-        int32_t n = epoll_wait(epfd, events, MAX_EVENTS, -1);
+        uint16_t closed_len = 0;
+        int32_t n = epoll_wait(epfd, events, 64, -1);
         if (n < 0) {
             const int err = errno;
-            ereport(INFO, errmsg("pg_websocket epoll: %s", strerror(err)));
+            ereport(WARNING, errmsg("pg_websocket epoll: %s", strerror(err)));
             break;
         }
         for (int32_t i = 0; i < n; i++) {
-            if (events[i].data.ptr != NULL) {
-                ws_handle_client_event(&events[i], epfd);
-            } else {
+            struct ws_conn* ws = events[i].data.ptr;
+            if (!ws) {
                 ws_handle_server_event(sockfd, epfd);
+                continue;
+            }
+            uint64_t conn_id = events[i].data.u64;
+            for (uint16_t j = 0; j < closed_len; j++) {
+                if (closed_conns[j] == conn_id) {
+                    conn_id = 0;
+                    break;
+                }
+            }
+            if (conn_id && !ws_handle_client_event(&events[i], epfd)) {
+                closed_conns[closed_len++] = conn_id;
+                if (ws->target) {
+                    closed_conns[closed_len++] = (uint64_t) ws->target;
+                }
+                ws_close(events[i].data.ptr, epfd);
             }
         }
     }
@@ -487,7 +520,8 @@ static bool ws_create_epoll(const int sockfd, int* epfd_out) {
                       .data.ptr = NULL,
                   })) {
         const int err = errno;
-        ereport(ERROR, errmsg("pg_websocket create epoll: %s", strerror(err)));
+        ereport(WARNING,
+                errmsg("pg_websocket create epoll: %s", strerror(err)));
         close(epfd);
         return false;
     }
@@ -496,7 +530,6 @@ static bool ws_create_epoll(const int sockfd, int* epfd_out) {
 }
 
 static bool ws_listen(const uint16_t port, int* fd_out) {
-
     int sockfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (sockfd < 0) {
         return false;
@@ -511,7 +544,7 @@ static bool ws_listen(const uint16_t port, int* fd_out) {
         || listen(sockfd, 64)) {
         const int err = errno;
         if (err != EINPROGRESS) {
-            ereport(ERROR,
+            ereport(WARNING,
                     errmsg("pg_websocket listen failed: %s", strerror(err)));
             close(sockfd);
             return false;
@@ -525,13 +558,18 @@ static void ws_sighandler(SIGNAL_ARGS) {
     ereport(DEBUG1, errmsg("pg_websocket stopping"));
 }
 
-void ws_main(Datum arg);
+void ws_main(Datum);
 void ws_main(Datum arg) {
     pqsignal(SIGTERM, ws_sighandler);
     pqsignal(SIGINT, SIG_IGN);
     BackgroundWorkerUnblockSignals();
 
-    const u_int16_t port = 15432;
+    const int port = atoi(config_listen_port);
+    if (port < 1) {
+        ereport(WARNING,
+                errmsg("pg_websocket invalid port: %s", config_listen_port));
+        return;
+    }
     int sockfd = 0;
     int epfd = 0;
     if (ws_listen(port, &sockfd) && ws_create_epoll(sockfd, &epfd)) {
@@ -548,6 +586,37 @@ void ws_main(Datum arg) {
 }
 
 void _PG_init(void) {
+    DefineCustomStringVariable("websocket.port",
+                               gettext_noop("pg_websocket listen port."),
+                               NULL,
+                               &config_listen_port,
+                               "15432",
+                               PGC_POSTMASTER,
+                               GUC_SUPERUSER_ONLY,
+                               NULL,
+                               NULL,
+                               NULL);
+    DefineCustomStringVariable("websocket.pg_host",
+                               gettext_noop("pg_websocket target host."),
+                               NULL,
+                               &config_backend_host,
+                               "localhost",
+                               PGC_POSTMASTER,
+                               GUC_SUPERUSER_ONLY,
+                               NULL,
+                               NULL,
+                               NULL);
+    DefineCustomStringVariable("websocket.pg_port",
+                               gettext_noop("pg_websocket target port."),
+                               NULL,
+                               &config_backend_port,
+                               "5432",
+                               PGC_POSTMASTER,
+                               GUC_SUPERUSER_ONLY,
+                               NULL,
+                               NULL,
+                               NULL);
+
     BackgroundWorker worker = {0};
     worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
     worker.bgw_restart_time = 60;
@@ -555,7 +624,6 @@ void _PG_init(void) {
     snprintf(worker.bgw_name, BGW_MAXLEN, "pg_websocket");
     snprintf(worker.bgw_library_name, BGW_MAXLEN, "pg_websocket");
     snprintf(worker.bgw_function_name, BGW_MAXLEN, "ws_main");
-
     RegisterBackgroundWorker(&worker);
 }
 
