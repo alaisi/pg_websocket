@@ -437,7 +437,7 @@ static bool ws_handle_client_event(struct ws_conn* ws,
             return false;
         }
     }
-    if (events & (EPOLLRDHUP | EPOLLHUP)) {
+    if (events & (EPOLLRDHUP | EPOLLHUP) || ws->state == WS_CLOSING) {
         ws->state = WS_CLOSING;
         return false;
     }
