@@ -1,5 +1,5 @@
 # pg_websocket
-PostgreSQL extension that adds support for WebSocket connections to a database. Supports standards PostgreSQL protocol in a binary WebSocket connection.
+PostgreSQL extension that adds support for WebSocket connections to a database. Supports standard PostgreSQL protocol in a binary WebSocket connection.
 
 Use with a WebSocket PostgreSQL client like [pegsocket.js](https://github.com/alaisi/pegsocket.js).
 
