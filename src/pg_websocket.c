@@ -37,6 +37,7 @@ typedef enum {
 typedef enum {
     WS_FRONTEND_HANDSHAKE,
     WS_FRONTEND_CONNECTED,
+    WS_BACKEND_STARTUP,
     WS_BACKEND_CONNECTED,
     WS_CLOSING,
 } ws_state;
@@ -51,12 +52,15 @@ struct ws_conn {
     struct ws_buf write_buf;
     struct ws_buf read_buf;
     struct ws_conn* target;
+    char auth[255];
 };
 
 // set from postgresql.conf:
 static char* config_listen_port = NULL;
 static char* config_backend_port = NULL;
 static char* config_backend_host = NULL;
+static char* config_auth_header_name = NULL;
+static char* config_auth = NULL;
 
 static bool run = true;
 
@@ -172,6 +176,15 @@ static bool ws_handshake(struct ws_conn* ws) {
         ws_send(ws, (uint8_t*) http_error, strlen(http_error));
         ws->state = WS_CLOSING;
         return false;
+    }
+
+    char auth[255] = {0};
+    if (strlen(config_auth_header_name)
+        && ws_handshake_get_header((char*) ws->read_buf.buffer,
+                                   config_auth_header_name,
+                                   auth,
+                                   sizeof(auth))) {
+        strncat(ws->auth, auth, sizeof(ws->auth) - 1);
     }
 
     char http_response[1024] = {0};
@@ -307,7 +320,7 @@ static bool ws_handshake_complete(struct ws_conn* ws, const int epfd) {
         free(backend);
         return false;
     }
-    backend->state = WS_BACKEND_CONNECTED;
+    backend->state = WS_BACKEND_STARTUP;
     backend->read_buf.len = 0;
     backend->write_buf.len = 0;
     backend->target = ws;
@@ -322,6 +335,39 @@ static bool ws_send_ping_response(struct ws_conn* ws,
     uint8_t header_len = 0;
     ws_frame_encode_header(ws->read_buf.len, WS_OP_PONG, header, &header_len);
     return ws_send(ws, header, header_len) && ws_send(ws, data, data_len);
+}
+
+static bool ws_add_auth_to_startup_packet(uint8_t* decoded,
+                                          uint16_t decoded_len,
+                                          uint16_t buf_len,
+                                          uint16_t* len_out,
+                                          char* auth) {
+    if (!strlen(auth)) {
+        *len_out = decoded_len;
+        return true;
+    }
+
+    uint32_t msg_len = ntohl(*(uint32_t*) decoded);
+    char options[1024];
+    uint32_t options_len = 0;
+    const char prefix[] = "options\0-c websocket.authentication=";
+    memcpy(options, prefix, sizeof(prefix) - 1);
+    options_len = sizeof(prefix) - 1;
+    memcpy(options + options_len, auth, strlen(auth));
+    options_len += strlen(auth);
+    options[options_len++] = 0;
+    options[options_len++] = 0;
+
+    uint32_t startup_len = msg_len + options_len - 1;
+    if (startup_len > buf_len) {
+        return false;
+    }
+    memcpy(decoded + msg_len - 1, options, options_len);
+    uint32_t be = htonl(startup_len);
+    memcpy(decoded, &be, 4);
+
+    *len_out = msg_len + options_len - 1;
+    return true;
 }
 
 static bool ws_handle_frontend_read(struct ws_conn* ws) {
@@ -345,7 +391,19 @@ static bool ws_handle_frontend_read(struct ws_conn* ws) {
             return false;
         }
         if (opcode == WS_OP_DATA_BINARY || opcode == WS_OP_NONE) {
-            if (!ws_send(ws->target, decoded, decoded_len)) {
+            if (ws->target->state == WS_BACKEND_STARTUP) {
+                uint16_t startup_len = 0;
+                if (!ws_add_auth_to_startup_packet(decoded,
+                                                   decoded_len,
+                                                   sizeof(ws->read_buf)
+                                                       - ws->read_buf.len,
+                                                   &startup_len,
+                                                   ws->auth)
+                    || !ws_send(ws->target, decoded, startup_len)) {
+                    return false;
+                }
+                ws->target->state = WS_BACKEND_CONNECTED;
+            } else if (!ws_send(ws->target, decoded, decoded_len)) {
                 return false;
             }
         } else if (opcode == WS_OP_PING) {
@@ -617,6 +675,29 @@ void _PG_init(void) {
                                "5432",
                                PGC_POSTMASTER,
                                GUC_SUPERUSER_ONLY,
+                               NULL,
+                               NULL,
+                               NULL);
+    DefineCustomStringVariable("websocket.authentication_header_name",
+                               gettext_noop(
+                                   "pg_websocket name of authentication "
+                                   "header to pass to backend."),
+                               NULL,
+                               &config_auth_header_name,
+                               "",
+                               PGC_POSTMASTER,
+                               GUC_SUPERUSER_ONLY,
+                               NULL,
+                               NULL,
+                               NULL);
+    DefineCustomStringVariable("websocket.authentication",
+                               gettext_noop(
+                                   "pg_websocket authentication variable."),
+                               NULL,
+                               &config_auth,
+                               "",
+                               PGC_BACKEND,
+                               GUC_DISALLOW_IN_FILE,
                                NULL,
                                NULL,
                                NULL);
