@@ -58,6 +58,8 @@ static char* config_listen_port = NULL;
 static char* config_backend_port = NULL;
 static char* config_backend_host = NULL;
 
+static bool run = true;
+
 static bool ws_flush(struct ws_conn* ws) {
     for (uint16_t len = ws->write_buf.len; len > 0;) {
         ssize_t sent = write(ws->fd, ws->write_buf.buffer, len);
@@ -476,10 +478,13 @@ static void ws_handle_server_event(const int sockfd, const int epfd) {
 static void ws_main_loop(const int sockfd, const int epfd) {
     struct epoll_event events[64];
     uint64_t closed_conns[64 * 2];
-    while (true) {
+    while (run) {
         int32_t n = epoll_wait(epfd, events, 64, -1);
         if (n < 0) {
             const int err = errno;
+            if (err == EAGAIN) {
+                continue;
+            }
             ereport(WARNING, errmsg(EXT_NAME " epoll: %s", strerror(err)));
             break;
         }
@@ -554,6 +559,7 @@ static bool ws_listen(const uint16_t port, int* fd_out) {
 
 static void ws_sighandler(SIGNAL_ARGS) {
     ereport(DEBUG1, errmsg(EXT_NAME " stopping"));
+    run = false;
 }
 
 void ws_main(Datum);
