@@ -348,6 +348,10 @@ static bool ws_add_auth_to_startup_packet(uint8_t* decoded,
     }
 
     uint32_t msg_len = ntohl(*(uint32_t*) decoded);
+    if (msg_len > decoded_len || decoded[msg_len - 1] != 0
+        || decoded[msg_len - 2] != 0) {
+        return false;
+    }
     char options[1024];
     uint32_t options_len = 0;
     const char prefix[] = "options\0-c websocket.authentication=";
