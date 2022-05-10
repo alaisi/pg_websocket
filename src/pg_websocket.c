@@ -120,16 +120,23 @@ static bool ws_handshake_get_header(const char* request,
                                     size_t value_out_len) {
     char header[255] = {0};
     sprintf(header, "%.252s: ", header_name);
+    const size_t header_len = strlen(header);
+    char cur_header[255] = {0};
     const char* crlf = "\r\n";
+    const size_t request_len = strlen(request);
     for (char* start = strstr(request, crlf); start;
          start = strstr(start, crlf)) {
         start += strlen(crlf);
-        if (strstr(start, header) == start) {
+        if (start + header_len >= request + request_len) {
+            break;
+        }
+        strncpy(cur_header, start, header_len);
+        if (strcasecmp(header, cur_header) == 0) {
             const char* end = strstr(start, crlf);
             if (!end || end - start >= (ssize_t) value_out_len - 1) {
                 break;
             }
-            const size_t len = strlen(header);
+            const size_t len = header_len;
             strncat(value_out, start + len, end - start - len);
             return true;
         }
@@ -155,18 +162,12 @@ static bool ws_handshake(struct ws_conn* ws) {
     if (!strstr((char*) ws->read_buf.buffer, "\r\n\r\n")) {
         return false;
     }
-    char protocol[255] = {0};
     char key[255] = {0};
     char hash[255] = {0};
     if (!ws_handshake_get_header((char*) ws->read_buf.buffer,
-                                 "Sec-WebSocket-Protocol",
-                                 protocol,
-                                 sizeof(protocol))
-        || strcmp("binary", protocol)
-        || !ws_handshake_get_header((char*) ws->read_buf.buffer,
-                                    "Sec-WebSocket-Key",
-                                    key,
-                                    sizeof(key))
+                                 "Sec-websocket-key",
+                                 key,
+                                 sizeof(key))
         || !ws_handshake_hash_key(key, //
                                   hash,
                                   sizeof(hash))) {
@@ -192,7 +193,6 @@ static bool ws_handshake(struct ws_conn* ws) {
             "HTTP/1.1 101 Switching Protocols\r\n"
             "Connection: Upgrade\r\n"
             "Upgrade: websocket\r\n"
-            "Sec-WebSocket-Protocol: binary\r\n"
             "Sec-WebSocket-Accept: %s\r\n\r\n",
             hash);
     return ws_send(ws, (uint8_t*) http_response, strlen(http_response));
@@ -544,7 +544,7 @@ static void ws_main_loop(const int sockfd, const int epfd) {
         int32_t n = epoll_wait(epfd, events, 64, -1);
         if (n < 0) {
             const int err = errno;
-            if (err == EAGAIN) {
+            if (err == EAGAIN || err == EINTR) {
                 continue;
             }
             ereport(WARNING, errmsg(EXT_NAME " epoll: %s", strerror(err)));
